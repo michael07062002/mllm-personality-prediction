@@ -1,15 +1,13 @@
-# src/model.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict
 
 import torch
 import torch.nn as nn
 
-from src.blocks.agf import AGFFusion
-from src.blocks.mamba2 import Mamba2Backbone, Mamba2Config
+from src.training.blocks.agf import AGFFusion
+from src.training.blocks.mamba2 import Mamba2Backbone, Mamba2Config
 
 
 @dataclass
@@ -29,71 +27,58 @@ class PersonalityModelConfig:
     use_layer_specific_projection: bool = False
 
 
-class SingleLayerInputProjection(nn.Module):
-    """
-    For x: (B, S, D_in) -> (B, S, D_model)
-    """
+def _sanitize(x: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
+
+class SingleLayerInputProjection(nn.Module):
     def __init__(self, input_dim: int, d_model: int, dropout: float = 0.1) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, d_model),
-            nn.Dropout(dropout),
-        )
+        self.norm = nn.LayerNorm(input_dim)
+        self.proj = nn.Linear(input_dim, d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        x = _sanitize(x.float())
+        x = self.norm(x)
+        x = self.proj(x)
+        x = self.dropout(x)
+        return _sanitize(x)
 
 
 class TemporalPooling(nn.Module):
-    """
-    Masked mean pooling over temporal dimension.
-    x:    (B, S, D)
-    mask: (B, S), True for valid positions
-    """
-
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        mask = mask.float().unsqueeze(-1)      # (B, S, 1)
+        x = _sanitize(x)
+        mask = mask.float().unsqueeze(-1)
         x = x * mask
         denom = mask.sum(dim=1).clamp_min(1.0)
         pooled = x.sum(dim=1) / denom
-        return pooled
+        return _sanitize(pooled)
 
 
 class RegressionHead(nn.Module):
     def __init__(self, d_model: int, num_outputs: int = 5, dropout: float = 0.1) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_outputs),
-        )
+        hidden = d_model // 2
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden, num_outputs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        x = _sanitize(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        return _sanitize(x)
 
 
 class PersonalityMambaModel(nn.Module):
-    """
-    Unified model.
-
-    Single-layer mode:
-        input x: (B, S, D_in)
-
-    Multi-layer mode:
-        input x: (B, L, S, D_in)
-
-    Output:
-        preds: (B, 5)
-    """
-
     def __init__(self, cfg: PersonalityModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.use_agf = cfg.use_agf
-
         if self.use_agf:
             self.fusion = AGFFusion(
                 input_dim=cfg.input_dim,
@@ -132,19 +117,18 @@ class PersonalityMambaModel(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
         aux: Dict[str, torch.Tensor] = {}
-
+        x = _sanitize(x)
+        mask = mask.bool()
         if self.use_agf:
-            # x: (B, L, S, D_in)
-            h, layer_weights = self.fusion(x)      # h: (B, S, D_model)
-            aux["layer_weights"] = layer_weights
+            h, layer_weights = self.fusion(x)
+            h = _sanitize(h)
+            aux["layer_weights"] = _sanitize(layer_weights)
         else:
-            # x: (B, S, D_in)
-            h = self.input_proj(x)                 # (B, S, D_model)
-
-        h = self.backbone(h)                       # (B, S, D_model)
-        pooled = self.pool(h, mask)                # (B, D_model)
-        preds = self.head(pooled)                  # (B, 5)
-
+            h = self.input_proj(x)
+        h = self.backbone(h)
+        h = _sanitize(h)
+        pooled = self.pool(h, mask)
+        preds = self.head(pooled)
         aux["temporal_features"] = h
         aux["pooled_features"] = pooled
         aux["preds"] = preds

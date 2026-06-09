@@ -1,0 +1,3 @@
+dataset: affwild2_va
+model: qwen25_vl_3b
+device: auto
